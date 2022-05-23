@@ -7,7 +7,7 @@ print("""Program Warning:
 NB: When "N run" is done, there will always be 'pending' stocks (denoted in "Additional Notes" column in 'Stock Database.xlsx'). Check them manually in our stock database to diagnose the problem (is the ticker wrong, does WSJ provide data for that stock, or is it just WSJ's server or our internet?). Once done, "C run" this program to loop over and 'process' them""")
 
 print('Program is running. Please wait...')
-import os, time, re
+import os, time, re, csv
 import datetime as dt
 import send2trash as s2t
 import openpyxl as opx
@@ -33,6 +33,8 @@ from selenium.webdriver.support import expected_conditions as EC
 class CannotFetchDataException(Exception):
 	pass
 class SkipValuationException(Exception):
+	pass
+class DataNotFoundException(Exception):
 	pass
 
 #Function: The Main Valuation Program
@@ -70,7 +72,7 @@ def stockValuation(stock_name, stock_ticker, country_code, valuation_type='New V
 					forceStop_handler()
 				else:
 					browser.quit()
-					raise CannotFetchDataException 				#if "try" block succeeds, it means the page is "404 Not Found" and we directly raise "CannotFetchDataException"
+					raise DataNotFoundException 				#if "try" block succeeds, it means the page is "404 Not Found" and we directly raise "DataNotFoundException"
 			else:
 				return data
 				break
@@ -544,7 +546,9 @@ def stockValuation(stock_name, stock_ticker, country_code, valuation_type='New V
 	#'Manually' open-save-close through xlwings (so that excel can recalculate the formulas based on our changes made), re-opens by openpyxl, then extracts the stock's valuation range and "Premium (Discount)" figure of the stock
 	open_excel_by_xlwings(valuationModel_rootAccess_directory)
 	book = opx.load_workbook(valuationModel_rootAccess_directory, data_only=True)
+	DCF_sheet = book['DCF Analysis']
 	valuation_sheet = book['Valuation']
+	dilutedShares = DCF_sheet['C5'].value / 1000		#since it is in form of thousands in our stock valuation model, we convert it to millions for our stock database
 	valuation_lowRange = valuation_sheet['F12'].value
 	valuation_highRange = valuation_sheet['G12'].value
 	premiumDiscount = valuation_sheet['F13'].value
@@ -576,7 +580,7 @@ def stockValuation(stock_name, stock_ticker, country_code, valuation_type='New V
 	elif save == 'N':
 		delete_directory_if_revaluation_stock(stock_directory)
 	#Returns the relevant data to be appended to stock database
-	relevantData = (newStatus, stock_fiscalYear, valuation_lowRange, valuation_highRange, stock_price)
+	relevantData = (newStatus, stock_fiscalYear, valuation_lowRange, valuation_highRange, stock_price, dilutedShares)
 	return relevantData
 
 #Function to decide on whether a stock will be revalued on the current valuation date based on its fiscal year. Must be 3-6 months (3 < x < 6) prior to current valuation date ("x"); ex: fiscal year June-May, if August is our valuation date, and since May is 3 months prior to August, hence the stock is revalued)
@@ -608,6 +612,7 @@ def stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuat
 		stockValuationRefresh_by_row[valuationLow_index] = np.nan
 		stockValuationRefresh_by_row[valuationHigh_index] = np.nan
 		stockValuationRefresh_by_row[previousClose_index] = np.nan
+		stockValuationRefresh_by_row[dilutedShares_index] = np.nan
 	if valuation_type == 'Price Refresh':			#same structure like our extract data function "pullData_from_WSJ"
 		browser = wd.Chrome(chromedriver_filepath, desired_capabilities=capa)
 		link = f'https://www.wsj.com/market-data/quotes/{country_code}/{stock_ticker}/financials/annual/income-statement'
@@ -650,7 +655,7 @@ def stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuat
 			browser.quit()
 	else:
 		try:
-			newStatus, fiscalYear, valuation_lowRange, valuation_highRange, stock_price = stockValuation(stock_name, stock_ticker, country_code, valuation_type=valuation_type, existing_status=existing_status)
+			newStatus, fiscalYear, valuation_lowRange, valuation_highRange, stock_price, dilutedShares = stockValuation(stock_name, stock_ticker, country_code, valuation_type=valuation_type, existing_status=existing_status)
 		except CannotFetchDataException:
 			if valuation_type == 'Revaluation':
 				stockValuationRefresh_by_row[additionalNotes_index] = revaluation_CannotFetchDataException_message
@@ -660,15 +665,23 @@ def stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuat
 			newStatus = 'Skipped'
 			stockValuationRefresh_by_row[status_index] = newStatus
 			clearColumns_if_valuation_is_skipped()
+		except DataNotFoundException:
+			stockValuationRefresh_by_row[additionalNotes_index] = DataNotFoundException_message
 		else:
 			if newStatus == 'Shortlisted':
-				if valuation_type == 'New Valuation':		#we only change 'Status' column if its a new valuation that returns "Shortlisted" as its status; if revaluation returns "Shortlisted", follow the previous predecent (either "Confirmed" or also "Shortlisted")
+				if valuation_type == 'New Valuation':		#we change 'Status' column if its a new valuation that returns "Shortlisted" as its status
 					stockValuationRefresh_by_row[status_index] = newStatus
-				stockValuationRefresh_by_row[additionalNotes_index] = np.nan
+					stockValuationRefresh_by_row[additionalNotes_index] = np.nan
+				elif valuation_type == 'Revaluation':		#if revalued stocks, we don't change 'Status' column, and instead leave it to follow its previous precedent ("Confirmed" or "Shortlisted"); if its precedent status is "Confirmed", write in "Additional Notes" column to remind us to re-confirm revenue growth projections based on the stock's newest financials
+					if existing_status == 'Confirmed':
+						stockValuationRefresh_by_row[additionalNotes_index] = "Revalued stock. Although revenue projections are 'confirmed' previously, please re-validate it based on the stock's newest financials (past revenue projections are based on past financials, hence new revenue projections must be based on new financials too)."
+					else:
+						stockValuationRefresh_by_row[additionalNotes_index] = np.nan
 				stockValuationRefresh_by_row[fiscalYear_index] = fiscalYear
 				stockValuationRefresh_by_row[valuationLow_index] = valuation_lowRange
 				stockValuationRefresh_by_row[valuationHigh_index] = valuation_highRange
 				stockValuationRefresh_by_row[previousClose_index] = stock_price
+				stockValuationRefresh_by_row[dilutedShares_index] = dilutedShares
 			elif newStatus == 'Skipped':
 				stockValuationRefresh_by_row[status_index] = newStatus
 				clearColumns_if_valuation_is_skipped()
@@ -679,15 +692,17 @@ directory = '/Users/delvinkennedy/sandbox/Personal Investments/Stocks'
 stockDatabase_directory = f'{directory}/Stock Database & Valuation Models/Stock Database.xlsx'
 valuationTemplate_directory = f'{directory}/Stock Database & Valuation Models/Stock Valuation.xlsx'
 valuationModel_rootAccess_directory = f'{directory}/Stock Database & Valuation Models/Stock Valuation (Root).xlsx'
+temporaryLog_directory = f'{directory}/temporary_log.csv'
 chromedriver_filepath = '/Users/delvinkennedy/sandbox/Python/chromedriver'
 capa = DesiredCapabilities.CHROME; capa["pageLoadStrategy"] = "none"		#this is default syntax to enable 'force stop' functionality
 #Loading stock database, and setting up global variables for the loop
 priceRefresh_CannotFetchDataException_message = 'Retrieve stock price pending: Cannot fetch data from WSJ.'
 revaluation_CannotFetchDataException_message = 'Revaluation pending: Cannot fetch data from WSJ.'
 newValuation_CannotFetchDataException_message = 'New valuation pending: Cannot fetch data from WSJ.'
+DataNotFoundException_message = 'Stock data not found in WSJ. Check whether the ticker is correct, or the stock exists.'
 countryType_startingRowIndex = 8; countryType_startingColIndex = 1; countryType_endingColIndex = 2
 countryType_table = pd.read_excel(stockDatabase_directory, skiprows=range(0, countryType_startingRowIndex-1), usecols=range(countryType_startingColIndex, countryType_endingColIndex+1))
-stockDatabase_startingRowIndex = 32; stockDatabase_startingColIndex = 1; stockDatabase_endingColIndex = 9
+stockDatabase_startingRowIndex = 32; stockDatabase_startingColIndex = 1; stockDatabase_endingColIndex = 10
 df_existingstockData = pd.read_excel(stockDatabase_directory, skiprows=range(0, stockDatabase_startingRowIndex-1), usecols=range(stockDatabase_startingColIndex, stockDatabase_endingColIndex+1))
 df_existingstockData = df_existingstockData.dropna(axis='index', how='all', subset=['Stock Name', 'Stock Ticker', 'Country'])
 status_index = df_existingstockData.columns.get_loc('Status')
@@ -696,6 +711,7 @@ fiscalYear_index = df_existingstockData.columns.get_loc('Fiscal Year')
 valuationLow_index = df_existingstockData.columns.get_loc('Valuation (Low)')
 valuationHigh_index = df_existingstockData.columns.get_loc('Valuation (High)')
 previousClose_index = df_existingstockData.columns.get_loc('Previous Close')
+dilutedShares_index = df_existingstockData.columns.get_loc('Diluted Shares')
 
 #Prompts for choice (normal vs clean-up): Normal will iterate over 'Status' column, while clean-up will iterate over 'Additional Notes' column
 choice = pyip.inputYesNo(prompt='Select type of valuation:\n1) Normal (please input N into the console)\n2) Clean-up (please input C into the console)\nYour choice: ', yesVal='N', noVal='C')
@@ -707,40 +723,43 @@ def mouse_movement(index):
 		pyag.move(-1, 0, duration=0.25)			#if index is odd number, relative movement by -1 pixel (to the left)
 num_of_rows, num_of_cols = df_existingstockData.shape
 stockDatabase = []
-for index in tqdm(range(num_of_rows), desc='Progress'):
-	stock_name = df_existingstockData.loc[index, 'Stock Name']
-	stock_ticker = df_existingstockData.loc[index, 'Stock Ticker']
-	country_code = df_existingstockData.loc[index, 'Country']
-	status = df_existingstockData.loc[index, 'Status']
-	if choice == 'N':
-		if status in ('Confirmed', 'Shortlisted'):
-			mouse_movement(index)			#so that our laptop doesn't go to sleep, as our program won't run if it does (even screensaver mode is also a no-go); we don't need to call this for "Skipped" stocks, as they won't consume any time at all to iterate (putting it there will just needlessly slow our program)
-			stock_fiscalYear = df_existingstockData.loc[index, 'Fiscal Year']
-			revaluation_prompt = revaluationPrompt(stock_fiscalYear)
-			if revaluation_prompt == 'Y':
-				stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Revaluation', existing_status=status)			#specially for 'Revaluation', we need to 'bring in' "status" to our function (since it will be used to decide on "save_condition" later on)
-			elif revaluation_prompt == 'N':
+with open(temporaryLog_directory, 'w') as temporaryLog_writer:
+	temporaryLog = csv.writer(temporaryLog_writer)			#so that in case the program crashes midway for whatever reason, we have the csv file to refer to instead of having to start all over again (saving of file directories and excel valuation files are not dependent on program completion)
+	for index in tqdm(range(num_of_rows), desc='Progress'):
+		stock_name = df_existingstockData.loc[index, 'Stock Name']
+		stock_ticker = df_existingstockData.loc[index, 'Stock Ticker']
+		country_code = df_existingstockData.loc[index, 'Country']
+		status = df_existingstockData.loc[index, 'Status']
+		if choice == 'N':
+			if status in ('Confirmed', 'Shortlisted'):
+				mouse_movement(index)			#so that our laptop doesn't go to sleep, as our program won't run if it does (even screensaver mode is also a no-go); we don't need to call this for "Skipped" stocks, as they won't consume any time at all to iterate (putting it there will just needlessly slow our program)
+				stock_fiscalYear = df_existingstockData.loc[index, 'Fiscal Year']
+				revaluation_prompt = revaluationPrompt(stock_fiscalYear)
+				if revaluation_prompt == 'Y':
+					stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Revaluation', existing_status=status)			#specially for 'Revaluation', we need to 'bring in' "status" to our function (since it will be used to decide on "save_condition" later on)
+				elif revaluation_prompt == 'N':
+					stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Price Refresh')
+			elif status != 'Skipped':
+				mouse_movement(index)
+				stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code)
+			elif status == 'Skipped':
+				stockData_by_row = np.array(df_existingstockData.loc[index])
+		elif choice == 'C':
+			additionalNotes = df_existingstockData.loc[index, 'Additional Notes']
+			if additionalNotes == priceRefresh_CannotFetchDataException_message:
+				mouse_movement(index)
 				stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Price Refresh')
-		elif status != 'Skipped':
-			mouse_movement(index)
-			stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code)
-		elif status == 'Skipped':
-			stockData_by_row = np.array(df_existingstockData.loc[index])
-	elif choice == 'C':
-		additionalNotes = df_existingstockData.loc[index, 'Additional Notes']
-		if additionalNotes == priceRefresh_CannotFetchDataException_message:
-			mouse_movement(index)
-			stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Price Refresh')
-		elif additionalNotes == revaluation_CannotFetchDataException_message:
-			mouse_movement(index)
-			stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Revaluation', existing_status=status)
-		elif additionalNotes == newValuation_CannotFetchDataException_message:
-			mouse_movement(index)
-			stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code)
-		else:
-			stockData_by_row = np.array(df_existingstockData.loc[index])
-	stockDatabase.append(stockData_by_row)
-	print(stockData_by_row)			#just for 'tracking' purposes (so we can 'track' the progress per stock and see whether our program is still running as expected)
+			elif additionalNotes == revaluation_CannotFetchDataException_message:
+				mouse_movement(index)
+				stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code, valuation_type='Revaluation', existing_status=status)
+			elif (additionalNotes == newValuation_CannotFetchDataException_message or additionalNotes == DataNotFoundException_message):
+				mouse_movement(index)
+				stockData_by_row = stock_valuationRefresh(index, stock_name, stock_ticker, country_code)
+			else:
+				stockData_by_row = np.array(df_existingstockData.loc[index])
+		stockDatabase.append(stockData_by_row)
+		temporaryLog.writerow(stockData_by_row)			#write on per row basis to "temporary_log.csv" file
+		print(stockData_by_row)			#just for 'tracking' purposes (so we can 'track' the progress per stock and see whether our program is still running as expected)
 #Organizes the list "stockDatabase" into a single dataframe
 numpy_stockDatabase = np.vstack(stockDatabase)
 df_stockDatabase = pd.DataFrame(numpy_stockDatabase)
